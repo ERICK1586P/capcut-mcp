@@ -1,0 +1,18 @@
+capcut-mcp
+Copyright 2026 Spectrika (https://spectrika.ru)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party software:
+
+* VectCutAPI (https://github.com/sun-guannan/VectCutAPI), commit d14e70749c9331424ab816a402bb45417c50cf68,
+  vendored unmodified as vendor/VectCutAPI-d14e7074.tar.gz (a `git archive` of that commit; its own
+  LICENSE file is inside the archive). Licensed under the Apache License, Version 2.0.
+* pyJianYingDraft (https://github.com/sun-guannan/pyJianYingDraft), Copyright (c) 2024 sun-guannan,
+  included inside the VectCutAPI archive. Licensed under the Apache License, Version 2.0.
+* Python packages listed in requirements.lock are installed into the Docker image from PyPI under
+  their respective licenses.
+
+CapCut and Jianying (剪映) are trademarks of their respective owners (ByteDance Ltd.). This project is
+not affiliated with, endorsed by or supported by ByteDance or CapCut. It reads and writes CapCut's
+local project files; use it at your own risk and keep backups of your projects.

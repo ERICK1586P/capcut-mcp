@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "capcut": {
+      "type": "local",
+      "command": ["docker", "run", "-i", "--rm", "--init", "--label", "app=capcut-mcp",
+        "-v", "C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft:/drafts",
+        "-v", "C:\\Users\\<you>\\Videos:/media:ro",
+        "-e", "CAPCUT_DRAFT_ROOT=C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft",
+        "-e", "VECTCUT_MEDIA_WIN_ROOT=C:\\Users\\<you>\\Videos",
+        "--memory", "2g", "--pids-limit", "256",
+        "capcut-mcp:local"],
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}

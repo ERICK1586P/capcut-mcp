@@ -1,0 +1,14 @@
+.smoke/
+.git/
+__pycache__/
+*.pyc
+README.md
+smoke_test.py
+test_timeline.py
+build.sh
+CHANGELOG.md
+local/
+docs/
+.github/
+CONTRIBUTING.md
+SECURITY.md

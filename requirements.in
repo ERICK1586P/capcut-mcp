@@ -1,0 +1,8 @@
+# Runtime deps actually imported by VectCutAPI's MCP path (upstream requirements.txt).
+# requirements-mcp.txt (mcp, aiohttp) is intentionally NOT included: mcp_server.py does not import it.
+flask
+requests
+oss2
+imageio
+psutil
+json5
