@@ -39,12 +39,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-WRAPPER_VERSION = "0.3.0"
+WRAPPER_VERSION = "0.4.0"
 
 REPO = os.environ.get("VECTCUT_REPO", "/app/VectCutAPI")
 DRAFTS_DIR = os.environ.get("VECTCUT_DRAFTS_DIR", "/drafts")
 MEDIA_DIR = os.environ.get("VECTCUT_MEDIA_DIR", "/media")
 STAGE_DIR = os.environ.get("VECTCUT_STAGE_DIR", "/tmp/vectcut-stage")
+BROLL_CACHE_DIR = os.environ.get(
+    "FETCHLAYER_CACHE_DIR", os.path.join(DRAFTS_DIR, ".capcut-mcp-broll-cache")
+)
+os.environ.setdefault("FETCHLAYER_CACHE_DIR", BROLL_CACHE_DIR)
+ASR_MODEL = os.environ.get("BROLL_ASR_MODEL", "small").strip() or "small"
+ASR_MODEL_CACHE = Path(os.environ.get("BROLL_ASR_CACHE_DIR", os.path.join(BROLL_CACHE_DIR, "models")))
+ASR_TRANSCRIPT_CACHE = Path(os.path.join(BROLL_CACHE_DIR, "transcripts"))
 CAPCUT_DRAFT_ROOT = os.environ.get("CAPCUT_DRAFT_ROOT", "").strip()
 MEDIA_WIN_ROOT = os.environ.get("VECTCUT_MEDIA_WIN_ROOT", "").strip()
 PROFILE_MODE = os.environ.get("VECTCUT_PROFILE_MODE", "capcut_9").strip().lower()
@@ -91,6 +98,7 @@ te = None
 
 # draft_id -> state of a project opened with open_project (see load_project)
 OPENED = {}
+ALIGNMENTS = {}
 
 
 _LENIENT_ERRNOS = {errno.EPERM, errno.EACCES, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)}
@@ -138,6 +146,8 @@ def bootstrap():
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
+    from tools.fetchlayer_tiktok import load_env_file
+    load_env_file(Path(here) / ".env")
     import timeline_edit as _te  # noqa: E402  (ours, lives next to entry.py)
 
     sys.path.insert(0, REPO)
@@ -345,6 +355,76 @@ NEW_TOOLS = [
     },
 ]
 
+BROLL_TOOLS = [
+    {
+        "name": "transcribe_project_audio",
+        "description": (
+            "Transcribe the treated narration audio in an existing CapCut project with local speech recognition, "
+            "return word timestamps and align them to the supplied full copy. The first use downloads the local model."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "draft_id": _str("Draft id returned by open_project."),
+            "copy_text": _str("The complete copy corresponding to the narration audio."),
+            "track_index": _int("Optional audio track index from describe_draft if the project has multiple audio tracks."),
+            "language": _str("Speech language code, or 'auto' to detect. Default: auto.", default="auto"),
+        }, "required": ["draft_id", "copy_text"]},
+    },
+    {
+        "name": "align_copy_phrase",
+        "description": "Return the aligned timeline timestamps for an exact phrase from a prior transcribe_project_audio result.",
+        "inputSchema": {"type": "object", "properties": {
+            "alignment_id": _str("alignment_id returned by transcribe_project_audio."),
+            "phrase": _str("Exact phrase copied from the supplied copy."),
+        }, "required": ["alignment_id", "phrase"]},
+    },
+    {
+        "name": "broll_coverage",
+        "description": (
+            "Measure unique narration time covered by B-roll tracks in the opened draft, merge overlapping alternatives, "
+            "and report the one-third milestone and uncovered gaps, including start/end gaps."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "draft_id": _str("Draft id returned by open_project."),
+            "audio_duration_sec": _num("Narration duration returned by transcribe_project_audio."),
+        }, "required": ["draft_id", "audio_duration_sec"]},
+    },
+    {
+        "name": "tiktok_search_videos",
+        "description": (
+            "Search public TikTok videos by a phrase from the copy. Returns candidate IDs, captions, authors, "
+            "durations and source links. Review semantic relevance and select three candidates before inserting."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "query": _str("Specific visual search query matching the spoken copy."),
+            "limit": {"type": "integer", "description": "Results to fetch (1-36; default 12).", "minimum": 1, "maximum": 36},
+        }, "required": ["query"]},
+    },
+    {
+        "name": "add_broll_options",
+        "description": (
+            "Download and add up to three TikTok candidates as muted, 5-second clips on three reusable "
+            "video tracks named broll_option_1, broll_option_2, and broll_option_3. Each option always "
+            "uses the matching track at every insertion point; never create a new track per point. "
+            "Requires an existing project opened with "
+            "open_project(mode='in_place'); does not save automatically. Call save_draft after all insertions, "
+            "with CapCut closed. Candidates must come from tiktok_search_videos and each must be at least 5 seconds."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "draft_id": _str("Draft id returned by open_project(mode='in_place')."),
+            "target_start": _num("Timeline time in seconds for all alternatives."),
+            "candidates": {"type": "array", "minItems": 1, "maxItems": 3,
+                "description": "One to three semantically relevant results returned by tiktok_search_videos.",
+                "items": {"type": "object", "properties": {
+                    "id": _str("TikTok video ID."),
+                    "url": _str("Canonical TikTok source URL."),
+                    "durationSeconds": _num("Source duration; must be at least 5 seconds."),
+                    "description": _str("Caption from search results."),
+                    "author": {"type": "object"},
+                }, "required": ["id", "url", "durationSeconds"]}},
+        }, "required": ["draft_id", "target_start", "candidates"]},
+    },
+]
+
 
 def patch_tools():
     tools = mcp_server.TOOLS
@@ -352,7 +432,7 @@ def patch_tools():
     media_note = (
         f" Accepts a public http(s) URL or a file under {MEDIA_DIR}/ (read-only mount"
         + (f" of {MEDIA_WIN_ROOT}" if MEDIA_WIN_ROOT else "")
-        + "). Private/LAN hosts and other local paths are rejected."
+        + f") or under the managed B-roll cache {BROLL_CACHE_DIR}. Private/LAN hosts and other local paths are rejected."
     )
     for tool, key in (("add_video", "video_url"), ("add_audio", "audio_url"),
                       ("add_image", "image_url"), ("get_video_duration", "video_url")):
@@ -394,6 +474,7 @@ def patch_tools():
         props["mask_type"]["description"] = "Mask type: rectangle, circle, linear, mirror, star."
         props.update(deepcopy(mask_props))
     by_name["add_video"]["inputSchema"]["properties"].update({
+        "duration": _num("Optional declared source duration in seconds; use with start/end to trim a segment."),
         "effect": _str("Optional scene effect applied to this clip only, e.g. 'Blur'."),
         "effect_strength": _num("Effect strength 0..100 (first effect parameter)."),
     })
@@ -410,6 +491,9 @@ def patch_tools():
                        "Default: the draft_id. Ignored for opened projects.",
     }
     for t in NEW_TOOLS:
+        if t["name"] not in by_name:
+            tools.append(t)
+    for t in BROLL_TOOLS:
         if t["name"] not in by_name:
             tools.append(t)
     if "capcut_healthcheck" not in by_name:
@@ -479,11 +563,12 @@ def resolve_media(key, value):
         return v  # inline SRT text
 
     candidate = _translate_windows_media(v)
-    media_root = os.path.realpath(MEDIA_DIR)
     real = os.path.realpath(candidate)
-    if real != media_root and not real.startswith(media_root + os.sep):
+    allowed_roots = (os.path.realpath(MEDIA_DIR), os.path.realpath(BROLL_CACHE_DIR))
+    allowed = any(real == root or real.startswith(root + os.sep) for root in allowed_roots)
+    if not allowed:
         raise ValueError(
-            f"{key}: local files must live under {MEDIA_DIR}/"
+            f"{key}: local files must live under {MEDIA_DIR}/ or the managed B-roll cache"
             + (f" (= {MEDIA_WIN_ROOT})" if MEDIA_WIN_ROOT else "")
             + f"; got {v!r}"
         )
@@ -1215,9 +1300,7 @@ def finalize_save_opened(args):
     text = staged.read_text(encoding="utf-8")
     text, rewritten = rewrite_text(text, f"{STAGE_DIR}/{draft_id}", join_fwd(win_root, meta["folder"]))
     data = json.loads(text)
-    new_bytes = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-    added_bytes, copied = 0, []
+    added_bytes, copied, staged_assets = 0, [], []
     assets = stage_dir / "assets"
     if assets.is_dir():
         for p in assets.rglob("*"):
@@ -1225,6 +1308,7 @@ def finalize_save_opened(args):
                 continue
             rel = p.relative_to(stage_dir)
             dst = project_dir / rel
+            staged_assets.append((p, rel, dst))
             if dst.is_file() and dst.stat().st_size == p.stat().st_size:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1232,16 +1316,79 @@ def finalize_save_opened(args):
             added_bytes += p.stat().st_size
             copied.append(str(rel).replace(os.sep, "/"))
 
+    # The upstream serializer can leave a placeholder path for downloaded media.
+    # Point each newly staged asset at its real location in the destination draft.
+    asset_by_name = {src.name: (src, rel, dst) for src, rel, dst in staged_assets}
+    for collection in (data.get("materials", {}).get("videos", []),
+                      data.get("materials", {}).get("audios", [])):
+        for material in collection:
+            staged_asset = asset_by_name.get(material.get("material_name", ""))
+            if staged_asset:
+                material["path"] = join_fwd(win_root, meta["folder"],
+                                            *staged_asset[1].parts)
+                if material.get("media_path") is not None:
+                    material["media_path"] = ""
+
+    # CapCut also reads imported media from draft_meta_info.json. Register new
+    # assets there, using the same record shape as write_draft_meta().
+    metadata_add_bytes = 0
+    meta_path = project_dir / "draft_meta_info.json"
+    draft_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else None
+    if draft_meta is not None:
+        material_groups = draft_meta.setdefault("draft_materials", [])
+        video_audio_group = next((g.setdefault("value", []) for g in material_groups
+                                  if g.get("type") == 0), None)
+        if video_audio_group is None:
+            video_audio_group = []
+            material_groups.append({"type": 0, "value": video_audio_group})
+        registered = {item.get("extra_info") for item in video_audio_group}
+        content_materials = data.get("materials", {})
+        material_lookup = {}
+        for key in ("videos", "audios"):
+            for material in content_materials.get(key, []):
+                material_lookup[material.get("material_name", "")] = material
+        now_us = _now_us()
+        now_s = now_us // 1_000_000
+        for src, rel, _dst in staged_assets:
+            name = src.name
+            if name in registered:
+                continue
+            category = rel.parts[1] if len(rel.parts) > 1 else ""
+            kind = {"video": "video", "image": "photo", "audio": "music"}.get(category)
+            if kind is None:
+                continue
+            material = material_lookup.get(name, {})
+            duration = int(material.get("duration") or 0)
+            path_value = join_fwd(win_root, meta["folder"], *rel.parts)
+            video_audio_group.append({
+                "ai_group_type": "", "create_time": now_s, "duration": duration,
+                "enter_from": 0, "extra_info": name, "file_Path": path_value,
+                "height": int(material.get("height") or 0), "id": str(uuid.uuid4()),
+                "import_time": now_s, "import_time_ms": now_us, "item_source": 1,
+                "material_color_tag": "", "md5": "", "metetype": kind,
+                "roughcut_time_range": {"duration": duration, "start": 0},
+                "sub_time_range": {"duration": -1, "start": -1}, "type": 0,
+                "width": int(material.get("width") or 0),
+            })
+            registered.add(name)
+            metadata_add_bytes += src.stat().st_size
+        draft_meta["tm_draft_modified"] = _now_us()
+
+    new_bytes = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    new_meta_bytes = (json.dumps(draft_meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                      if draft_meta is not None else None)
+
     ts = time.strftime("%Y%m%d-%H%M%S")
     backup = project_dir / f"draft_content.json.vectcut-bak-{ts}"
     backup.write_bytes(old)
-    meta_path = project_dir / "draft_meta_info.json"
     if meta_path.is_file():
         (project_dir / f"draft_meta_info.json.vectcut-bak-{ts}").write_bytes(meta_path.read_bytes())
     _prune_backups(project_dir, "draft_content.json")
     _prune_backups(project_dir, "draft_meta_info.json")
 
     root.write_bytes(new_bytes)
+    if new_meta_bytes is not None:
+        meta_path.write_bytes(new_meta_bytes)
     mirrors = []
     for pattern in MIRROR_CANDIDATES:
         for p in project_dir.glob(pattern):
@@ -1254,7 +1401,7 @@ def finalize_save_opened(args):
                     log.warning("mirror %s not updated: %s", p, exc)
     now = _now_us()
     _update_meta_file(project_dir, tm_draft_modified=now, tm_duration=int(data.get("duration") or 0),
-                      draft_timeline_materials_size_=lambda v: int(v or 0) + added_bytes)
+                      draft_timeline_materials_size_=lambda v: int(v or 0) + metadata_add_bytes)
     _update_settings_file(project_dir, draft_last_edit_time=now // 1_000_000)
     shutil.rmtree(stage_dir, ignore_errors=True)
     meta["sha256"] = _sha256(new_bytes)
@@ -1374,6 +1521,27 @@ def healthcheck():
 
     add("wrapper", True,
         f"capcut-mcp {WRAPPER_VERSION}; upstream VectCutAPI {UPSTREAM_SHA[:8]}; python {sys.version.split()[0]}")
+    key_configured = bool(os.environ.get("FETCHLAYER_API_KEY", "").strip())
+    add("fetchlayer_key", key_configured,
+        "FETCHLAYER_API_KEY configured" if key_configured else "FETCHLAYER_API_KEY missing; TikTok search/download unavailable",
+        critical=False)
+    try:
+        import importlib.util
+        asr_ready = importlib.util.find_spec("faster_whisper") is not None
+        add("asr_runtime", asr_ready,
+            "local speech recognition is installed" if asr_ready else "faster-whisper is not installed; transcription unavailable",
+            critical=False)
+    except Exception as exc:  # noqa: BLE001
+        add("asr_runtime", False, f"could not inspect local speech recognition: {type(exc).__name__}", critical=False)
+    try:
+        cache = Path(BROLL_CACHE_DIR)
+        cache.mkdir(parents=True, exist_ok=True)
+        probe = cache / ".write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        add("broll_cache", True, f"managed B-roll cache is writable: {BROLL_CACHE_DIR}", critical=False)
+    except Exception as exc:  # noqa: BLE001
+        add("broll_cache", False, f"{BROLL_CACHE_DIR}: {exc}", critical=False)
     prof = draft_profiles.get_draft_profile()
     platform = prof.platform or {}
     add("profile",
@@ -1444,8 +1612,315 @@ def healthcheck():
 
 # --------------------------------------------------------------------------- dispatch
 
+def transcribe_project_audio(args):
+    import audio_alignment as aa
+
+    args = args or {}
+    draft_id = validate_draft_id(args.get("draft_id"))
+    meta = OPENED.get(draft_id)
+    if meta is None:
+        raise ValueError("open the existing CapCut project before transcribing its narration")
+    copy_text = args.get("copy_text")
+    if not isinstance(copy_text, str) or not copy_text.strip():
+        raise ValueError("copy_text must contain the full ad copy")
+    track_index = args.get("track_index")
+    if track_index is not None and (not isinstance(track_index, int) or isinstance(track_index, bool) or track_index < 0):
+        raise ValueError("track_index must be a non-negative audio track index")
+    language = args.get("language", "auto")
+    if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z-]{2,12}|auto", language):
+        raise ValueError("language must be a language code such as 'pt' or 'auto'")
+
+    script = draft_cache.DRAFT_CACHE[draft_id]
+    content, _ = serialize_script(script)
+    all_audio = aa.select_audio_segments(content, track_index=track_index)
+    if not all_audio:
+        raise ValueError("no usable audio segments were found on the selected CapCut audio track")
+    if track_index is None:
+        durations: dict[int, float] = {}
+        for segment in all_audio:
+            durations[segment["track_index"]] = durations.get(segment["track_index"], 0.0) + segment["target_duration_sec"]
+        best_track = max(durations, key=durations.get)
+        all_audio = [segment for segment in all_audio if segment["track_index"] == best_track]
+
+    project_dir = Path(meta["dir"])
+    timeline_words, cache_hits, sources = [], 0, {}
+    detected_languages = set()
+    for segment in all_audio:
+        material = segment["material"]
+        raw_path = next((material.get(k) for k in ("path", "media_path", "file_path", "file_Path")
+                         if isinstance(material.get(k), str) and material.get(k).strip()), "")
+        path = aa.resolve_project_media_path(
+            raw_path,
+            project_dir=project_dir,
+            drafts_dir=Path(DRAFTS_DIR),
+            media_dir=Path(MEDIA_DIR),
+            capcut_win_root=CAPCUT_DRAFT_ROOT,
+            media_win_root=MEDIA_WIN_ROOT,
+            fallback_names=tuple(str(material.get(k) or "") for k in ("material_name", "name")),
+        )
+        path_key = str(path)
+        if path_key not in sources:
+            words, detected, cache_hit = aa.transcribe_media(
+                path, model_name=ASR_MODEL, language=language,
+                model_cache=ASR_MODEL_CACHE, transcript_cache=ASR_TRANSCRIPT_CACHE,
+            )
+            sources[path_key] = words
+            if detected:
+                detected_languages.add(detected)
+            cache_hits += int(cache_hit)
+        source_start = segment["source_start_sec"]
+        source_end = source_start + segment["source_duration_sec"] if segment["source_duration_sec"] > 0 else float("inf")
+        target_start = segment["target_start_sec"]
+        target_end = target_start + segment["target_duration_sec"]
+        speed = segment["speed"]
+        for word in sources[path_key]:
+            if word["end_sec"] <= source_start or word["start_sec"] >= source_end:
+                continue
+            start = target_start + max(0.0, word["start_sec"] - source_start) / speed
+            end = target_start + max(0.0, min(source_end, word["end_sec"]) - source_start) / speed
+            start = max(target_start, min(target_end, start))
+            end = max(start, min(target_end, end))
+            if end > start:
+                timeline_words.append({"text": word["text"], "start_sec": start,
+                                       "end_sec": end, "probability": word.get("probability")})
+    timeline_words.sort(key=lambda item: (item["start_sec"], item["end_sec"]))
+    if not timeline_words:
+        raise ValueError("no timestamped speech was found inside the narration segment on the selected track")
+
+    alignment = aa.align_copy(copy_text, timeline_words)
+    alignment_id = uuid.uuid4().hex
+    ALIGNMENTS[alignment_id] = {"draft_id": draft_id, "alignment": alignment}
+    duration_sec = max(s["target_start_sec"] + s["target_duration_sec"] for s in all_audio)
+    return {
+        "alignment_id": alignment_id,
+        "audio_track_index": all_audio[0]["track_index"],
+        "audio_track_name": all_audio[0]["track_name"],
+        "audio_duration_sec": round(duration_sec, 3),
+        "detected_language": sorted(detected_languages),
+        "model": ASR_MODEL,
+        "transcription_cache_hits": cache_hits,
+        "transcript": " ".join(word["text"].strip() for word in timeline_words),
+        "copy_alignment": alignment,
+        "timing_note": "Word timestamps come from local speech recognition; inspect low-match copy words before using a point.",
+    }
+
+
+def align_copy_phrase(args):
+    import audio_alignment as aa
+
+    args = args or {}
+    alignment_id = args.get("alignment_id")
+    phrase = args.get("phrase")
+    if not isinstance(alignment_id, str) or alignment_id not in ALIGNMENTS:
+        raise ValueError("alignment_id was not returned by transcribe_project_audio in this MCP session")
+    if not isinstance(phrase, str) or not phrase.strip():
+        raise ValueError("phrase must be a non-empty excerpt copied from the ad copy")
+    return aa.locate_copy_phrase(ALIGNMENTS[alignment_id]["alignment"], phrase.strip())
+
+
+def broll_coverage(args):
+    args = args or {}
+    draft_id = validate_draft_id(args.get("draft_id"))
+    if draft_id not in OPENED:
+        raise ValueError("open the existing CapCut project before measuring B-roll coverage")
+    duration = args.get("audio_duration_sec")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration <= 0:
+        raise ValueError("audio_duration_sec must be greater than zero")
+    content, _ = serialize_script(draft_cache.DRAFT_CACHE[draft_id])
+    intervals, clip_count = [], 0
+    for track in content.get("tracks") or []:
+        if not str(track.get("name", "")).startswith("broll_"):
+            continue
+        for segment in track.get("segments") or []:
+            target = segment.get("target_timerange") or {}
+            start = int(target.get("start", 0)) / 1_000_000
+            end = start + int(target.get("duration", 0)) / 1_000_000
+            start, end = max(0.0, start), min(float(duration), end)
+            if end > start:
+                intervals.append((start, end))
+                clip_count += 1
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    gaps = []
+    cursor = 0.0
+    for start, end in merged:
+        if start > cursor:
+            gaps.append({"start_sec": round(cursor, 3), "end_sec": round(start, 3),
+                         "duration_sec": round(start - cursor, 3)})
+        cursor = max(cursor, end)
+    if cursor < duration:
+        gaps.append({"start_sec": round(cursor, 3), "end_sec": round(float(duration), 3),
+                     "duration_sec": round(float(duration) - cursor, 3)})
+    covered = sum(end - start for start, end in merged)
+    ratio = covered / float(duration)
+    return {
+        "audio_duration_sec": round(float(duration), 3),
+        "broll_clips_placed": clip_count,
+        "unique_covered_sec": round(covered, 3),
+        "coverage_ratio": round(ratio, 4),
+        "coverage_percent": round(ratio * 100, 1),
+        "one_third_reached": ratio >= (1 / 3),
+        "uncovered_gaps": gaps,
+        "gaps_over_7_sec": [gap for gap in gaps if gap["duration_sec"] > 7],
+        "max_uncovered_gap_sec": max((gap["duration_sec"] for gap in gaps), default=0),
+        "coverage_intervals": [{"start_sec": round(start, 3), "end_sec": round(end, 3)} for start, end in merged],
+    }
+
+def tiktok_search_videos(args):
+    from tools.fetchlayer_tiktok import FetchLayerTikTok
+
+    args = args or {}
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    limit = args.get("limit", 12)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 36:
+        raise ValueError("limit must be an integer from 1 to 36")
+    client = FetchLayerTikTok(cache_dir=BROLL_CACHE_DIR)
+    balance_before = client.available_credits()
+    estimated_search_cost = (limit + 11) // 12
+    if balance_before < estimated_search_cost:
+        raise ValueError(
+            f"FetchLayer has {balance_before} credits; this search may need up to {estimated_search_cost}. "
+            "Top up credits or lower the result limit before searching."
+        )
+    response = client.search(query.strip(), limit=limit)
+    candidates = []
+    for video in response.get("videos", []):
+        author = video.get("author") or {}
+        candidates.append({
+            "id": video.get("id"),
+            "url": video.get("url"),
+            "description": video.get("description"),
+            "durationSeconds": video.get("durationSeconds"),
+            "isPhotoPost": bool(video.get("isPhotoPost")),
+            "downloadable": any(
+                asset.get("kind") == "video" and asset.get("downloadUrl")
+                for asset in video.get("assets", [])
+            ),
+            "author": {
+                "uniqueId": author.get("uniqueId"),
+                "nickname": author.get("nickname"),
+                "verified": author.get("verified"),
+                "profileUrl": author.get("profileUrl"),
+            },
+            "hashtags": video.get("hashtags", []),
+            "playCount": (video.get("stats") or {}).get("playCount"),
+        })
+    return {
+        "query": response.get("query", query),
+        "pages_fetched": response.get("pagesFetched", 0),
+        "credits_estimate_search": response.get("pagesFetched", 0),
+        "credits_before_search": balance_before,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "notes": response.get("notes", []),
+    }
+
+
+def add_broll_options(args):
+    from concurrent.futures import ThreadPoolExecutor
+    from tools.fetchlayer_tiktok import FetchLayerTikTok
+
+    args = args or {}
+    draft_id = validate_draft_id(args.get("draft_id"))
+    meta = OPENED.get(draft_id)
+    if meta is None:
+        raise ValueError("open the existing CapCut project with open_project first")
+    if meta.get("mode") != "in_place":
+        raise ValueError("this workflow edits the original project; reopen it with mode='in_place'")
+    target_start = args.get("target_start")
+    if isinstance(target_start, bool) or not isinstance(target_start, (int, float)) or target_start < 0:
+        raise ValueError("target_start must be a non-negative timeline time in seconds")
+    candidates = args.get("candidates")
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= 3:
+        raise ValueError("one to three candidate objects from tiktok_search_videos are required")
+
+    selected = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("each candidate must be an object from tiktok_search_videos")
+        video_id = str(candidate.get("id", ""))
+        if not re.fullmatch(r"\d{8,30}", video_id):
+            raise ValueError("candidate contains an invalid TikTok video id")
+        if video_id in seen:
+            raise ValueError("the three candidate video ids must be unique")
+        seen.add(video_id)
+        duration = candidate.get("durationSeconds")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 5:
+            raise ValueError(f"TikTok candidate {video_id} is shorter than 5 seconds or has no duration")
+        source_url = candidate.get("url", "")
+        if not re.fullmatch(rf"https://www\.tiktok\.com/@[^/]+/video/{video_id}(?:\?[^\s]*)?", source_url):
+            raise ValueError(f"candidate {video_id} does not have a canonical TikTok video URL")
+        selected.append({"id": video_id, "url": source_url, "durationSeconds": duration,
+                         "description": candidate.get("description"), "author": candidate.get("author") or {}})
+
+    client = FetchLayerTikTok(cache_dir=BROLL_CACHE_DIR)
+    credits_needed = sum(not client.cached_path(item["id"]).is_file() for item in selected)
+    balance_before = client.available_credits()
+    if balance_before < credits_needed:
+        raise ValueError(
+            f"FetchLayer has {balance_before} credits; downloading these candidates needs {credits_needed}. "
+            "Top up credits or choose already cached candidates before inserting."
+        )
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        paths = list(pool.map(lambda item: client.download_id(item["id"]), selected))
+
+    added = []
+    for index, (candidate, path) in enumerate(zip(selected, paths), start=1):
+        track_name = f"broll_option_{index}"
+        result = execute_tool_wrapper("add_video", {
+            "draft_id": draft_id,
+            "video_url": str(path),
+            "start": 0,
+            "end": 5,
+            "duration": float(candidate["durationSeconds"]),
+            "target_start": float(target_start),
+            "volume": 0,
+            "track_name": track_name,
+        })
+        if not isinstance(result, dict) or result.get("success") is False:
+            return {"success": False, "added_count": len(added), "error": result,
+                    "partial_insertions": added, "saved": False}
+        added.append({
+            "option": index,
+            "video_id": candidate["id"],
+            "source_url": candidate["url"],
+            "description": candidate.get("description"),
+            "author": candidate.get("author"),
+            "local_file": str(path),
+            "track_name": track_name,
+            "target_start": float(target_start),
+            "duration_sec": 5,
+            "muted": True,
+        })
+    return {"success": True, "added_count": len(added), "covered_duration_sec": 5,
+            "coverage_counted_once": True, "credits_estimate_download": credits_needed,
+            "credits_before_download": balance_before, "options": added, "saved": False,
+            "next_step": "After all additions, call save_draft with CapCut closed."}
+
 def execute_tool_wrapper(tool_name, arguments):
     try:
+        if tool_name == "transcribe_project_audio":
+            return {"success": True, "result": transcribe_project_audio(arguments)}
+        if tool_name == "align_copy_phrase":
+            return {"success": True, "result": align_copy_phrase(arguments)}
+        if tool_name == "broll_coverage":
+            return {"success": True, "result": broll_coverage(arguments)}
+        if tool_name == "tiktok_search_videos":
+            return {"success": True, "result": tiktok_search_videos(arguments)}
+        if tool_name == "add_broll_options":
+            result = add_broll_options(arguments)
+            if result.get("success") is False:
+                return {"success": False, "error": "B-roll insertion was partial; inspect details before saving.",
+                        "details": result}
+            return {"success": True, "result": result}
         if tool_name == "capcut_healthcheck":
             return {"success": True, "result": healthcheck()}
         if tool_name == "list_projects":
@@ -1529,6 +2004,12 @@ def handle_line(line):
 
 
 def main():
+    # MCP stdio messages are UTF-8 by protocol. On Windows, Python can inherit
+    # the active code page for redirected pipes, corrupting accented copy text.
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8")
     bootstrap()
     patch_profile()
     patch_tools()

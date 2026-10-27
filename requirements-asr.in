@@ -1,0 +1,4 @@
+# Optional local speech transcription with word timestamps. Kept separate from
+# the CapCut MCP runtime so the audio model can be added without changing core deps.
+faster-whisper==1.2.1
+av==18.1.0

@@ -64,11 +64,13 @@ cd capcut-mcp
 repo folder:
 
 ```powershell
-docker build --build-arg WRAPPER_VERSION=0.3.0 -t capcut-mcp:0.3.0 .
-docker tag capcut-mcp:0.3.0 capcut-mcp:local
+docker build --build-arg WRAPPER_VERSION=0.4.0 -t capcut-mcp:0.4.0 .
+docker tag capcut-mcp:0.4.0 capcut-mcp:local
 ```
 
 The image is `python:3.12-slim` + ffmpeg + the vendored engine; it runs as an unprivileged user and exposes no ports.
+It also installs the optional local ASR runtime from `requirements-asr.lock`; the first transcription downloads the
+multilingual `small` model into the managed cache under `/drafts`, which persists with the CapCut projects mount.
 
 Optional checks before wiring up a client:
 
@@ -135,6 +137,7 @@ work. The Desktop app and the CLI share this file. Add the server under the `mcp
     "capcut": {
       "type": "local",
       "command": ["docker", "run", "-i", "--rm", "--init", "--label", "app=capcut-mcp",
+        "--env-file", "C:\\Users\\<you>\\Documents\\Codex\\<path-to-project>\\capcut-mcp\\.env",
         "-v", "C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft:/drafts",
         "-v", "C:\\Users\\<you>\\Videos:/media:ro",
         "-e", "CAPCUT_DRAFT_ROOT=C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft",
@@ -147,6 +150,12 @@ work. The Desktop app and the CLI share this file. Add the server under the `mcp
   }
 }
 ```
+
+Replace `<path-to-project>` with the folder that contains this repository's `.env` file. The file must define
+`FETCHLAYER_API_KEY=...`; Docker reads it at launch and passes the value to the container without putting the key
+in the image or command arguments. Keep `.env` out of Git and do not paste its contents into chat.
+When running `launch_capcut_mcp.py` directly instead of Docker, the server reads `.env` from the repository folder
+itself, so no Docker `--env-file` setting is needed.
 
 `type: "local"` means OpenCode spawns the command and speaks MCP over stdio, exactly like Claude Desktop.
 `timeout` (milliseconds) is the time OpenCode waits for the tool list; the 5-second default can be too short

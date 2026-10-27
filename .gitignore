@@ -3,3 +3,14 @@ __pycache__/
 *.pyc
 .venv/
 local/
+.env
+.env.*
+!.env.example
+media/
+pip-cache/
+work/
+stage/
+test-area/
+work-tmp/
+tools/ffmpeg/
+vendor/VectCutAPI/

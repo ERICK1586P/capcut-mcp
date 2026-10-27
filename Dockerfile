@@ -29,7 +29,9 @@ WORKDIR /app
 
 # Locked, hash-pinned Python deps (uv pip compile --generate-hashes requirements.in)
 COPY requirements.lock /app/requirements.lock
+COPY requirements-asr.lock /app/requirements-asr.lock
 RUN pip install --require-hashes -r /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements-asr.lock
 
 # Upstream source, vendored as a deterministic `git archive` of the pinned commit
 # (extracts to /app/VectCutAPI/ because the archive was created with --prefix=VectCutAPI/).
@@ -38,7 +40,8 @@ ADD vendor/VectCutAPI-d14e7074.tar.gz /app/
 # Our container config, CapCut 9.3 template and the wrapper.
 COPY config.json /app/VectCutAPI/config.json
 COPY template_capcut_9/ /app/VectCutAPI/template_capcut_9/
-COPY platform_capcut_9.json entry.py timeline_edit.py /app/
+COPY platform_capcut_9.json entry.py timeline_edit.py audio_alignment.py /app/
+COPY tools/fetchlayer_tiktok.py /app/tools/fetchlayer_tiktok.py
 
 RUN useradd --uid 10001 --create-home --home-dir /tmp/appuser appuser \
  && chown -R appuser:appuser /app

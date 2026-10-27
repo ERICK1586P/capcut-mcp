@@ -4,6 +4,7 @@
     "capcut": {
       "type": "local",
       "command": ["docker", "run", "-i", "--rm", "--init", "--label", "app=capcut-mcp",
+        "--env-file", "C:\\Users\\<you>\\Documents\\Codex\\<path-to-project>\\capcut-mcp\\.env",
         "-v", "C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft:/drafts",
         "-v", "C:\\Users\\<you>\\Videos:/media:ro",
         "-e", "CAPCUT_DRAFT_ROOT=C:\\Users\\<you>\\AppData\\Local\\CapCut\\User Data\\Projects\\com.lveditor.draft",
